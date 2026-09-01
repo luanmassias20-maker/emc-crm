@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-import csv, io, os, re, sqlite3, sys, tempfile, time, zipfile
+import csv, io, os, re, sqlite3, tempfile, time, zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 ROOT="https://dadosabertos.rfb.gov.br/CNPJ/dados_abertos_cnpj/"
 SUPABASE_URL=os.environ["SUPABASE_URL"].rstrip("/")
@@ -13,17 +14,54 @@ RETENTION_DAYS=int(os.getenv("RFB_RETENTION_DAYS","180"))
 BATCH=int(os.getenv("SUPABASE_BATCH_SIZE","500"))
 FORCE=os.getenv("FORCE_UPDATE","0")=="1"
 HEADERS={"apikey":SERVICE_KEY,"Authorization":f"Bearer {SERVICE_KEY}"}
-SESSION=requests.Session()
-SESSION.headers.update({"User-Agent":"EMC-CRM-RFB-Updater/1.0"})
 
-def log(msg): print(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}",flush=True)
+# Sessao robusta: retries automáticos para timeout, 429 e erros 5xx.
+SESSION=requests.Session()
+retry=Retry(
+    total=6,
+    connect=6,
+    read=6,
+    status=6,
+    backoff_factor=5,
+    status_forcelist=(429,500,502,503,504),
+    allowed_methods=frozenset(["GET","HEAD"]),
+    raise_on_status=False,
+)
+adapter=HTTPAdapter(max_retries=retry,pool_connections=4,pool_maxsize=4)
+SESSION.mount("https://",adapter)
+SESSION.mount("http://",adapter)
+SESSION.headers.update({"User-Agent":"EMC-CRM-RFB-Updater/2.0 (+https://github.com/luanmassias20-maker/emc-crm)"})
+
+def log(msg):
+    print(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}",flush=True)
+
+def get_with_fallback(url, *, stream=False, connect_timeout=120, read_timeout=900, attempts=4):
+    """GET resiliente, com tentativas adicionais além das do adapter."""
+    last=None
+    for attempt in range(1,attempts+1):
+        try:
+            log(f"Acessando {url} (tentativa {attempt}/{attempts})")
+            r=SESSION.get(url,stream=stream,timeout=(connect_timeout,read_timeout))
+            r.raise_for_status()
+            return r
+        except (requests.ConnectionError,requests.Timeout,requests.HTTPError) as e:
+            last=e
+            if attempt>=attempts:
+                break
+            wait=min(120,15*attempt)
+            log(f"Fonte indisponível temporariamente: {type(e).__name__}. Nova tentativa em {wait}s.")
+            time.sleep(wait)
+    raise RuntimeError(f"Não foi possível acessar {url} após {attempts} tentativas: {last}")
 
 def get_latest_competencia():
-    r=SESSION.get(ROOT,timeout=60); r.raise_for_status()
-    comps=sorted(set(re.findall(r'href=["\'](\d{4}-\d{2})/?["\']',r.text)))
+    # O diretório raiz da RFB por vezes demora a responder. Não abortamos na primeira falha.
+    with get_with_fallback(ROOT,connect_timeout=120,read_timeout=180,attempts=5) as r:
+        text=r.text
+    comps=sorted(set(re.findall(r'href=["\'](\d{4}-\d{2})/?["\']',text)))
     if not comps:
-        comps=sorted(set(re.findall(r'(\d{4}-\d{2})/',r.text)))
-    if not comps: raise RuntimeError("Nenhuma competência encontrada no diretório oficial da RFB.")
+        comps=sorted(set(re.findall(r'(\d{4}-\d{2})/',text)))
+    if not comps:
+        raise RuntimeError("Nenhuma competência encontrada no diretório oficial da RFB.")
     return comps[-1]
 
 def latest_completed():
@@ -49,11 +87,13 @@ def status_finish(row_id,count,error=None):
 
 def download(url,path):
     log(f"Baixando {url}")
-    with SESSION.get(url,stream=True,timeout=(30,900)) as r:
-        r.raise_for_status()
+    with get_with_fallback(url,stream=True,connect_timeout=120,read_timeout=1800,attempts=5) as r:
         with open(path,"wb") as f:
             for chunk in r.iter_content(1024*1024):
-                if chunk: f.write(chunk)
+                if chunk:
+                    f.write(chunk)
+    if not path.exists() or path.stat().st_size==0:
+        raise RuntimeError(f"Download vazio: {url}")
 
 def zip_rows(path):
     with zipfile.ZipFile(path) as z:
@@ -94,9 +134,12 @@ def process_estabelecimentos(comp,conn,municipios,cnaes):
         with tempfile.TemporaryDirectory() as td:
             p=Path(td)/f"Estabelecimentos{i}.zip"
             url=f"{ROOT}{comp}/Estabelecimentos{i}.zip"
-            try: download(url,p)
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code==404: continue
+            try:
+                download(url,p)
+            except Exception as e:
+                # Alguns índices podem não existir em determinadas competências.
+                if "404" in str(e):
+                    continue
                 raise
             batch=[]
             for r in zip_rows(p):
@@ -111,7 +154,8 @@ def process_estabelecimentos(comp,conn,municipios,cnaes):
                 batch.append((cnpj,basic.upper(),None,clean_text(r[4]),parse_date(opening),"ATIVA",cnae,cnaes.get(cnae,""),None,None,None,municipios.get(mun_code,mun_code),uf,phone,email))
                 if len(batch)>=5000:
                     conn.executemany("insert or replace into selected values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",batch);conn.commit();inserted+=len(batch);batch=[]
-            if batch: conn.executemany("insert or replace into selected values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",batch);conn.commit();inserted+=len(batch)
+            if batch:
+                conn.executemany("insert or replace into selected values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",batch);conn.commit();inserted+=len(batch)
             log(f"Estabelecimentos{i}: candidatos acumulados {inserted}")
     return inserted
 
@@ -120,9 +164,10 @@ def process_empresas(comp,conn):
     for i in range(10):
         with tempfile.TemporaryDirectory() as td:
             p=Path(td)/f"Empresas{i}.zip"
-            try: download(f"{ROOT}{comp}/Empresas{i}.zip",p)
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code==404: continue
+            try:
+                download(f"{ROOT}{comp}/Empresas{i}.zip",p)
+            except Exception as e:
+                if "404" in str(e): continue
                 raise
             cur=conn.cursor()
             for r in zip_rows(p):
@@ -171,10 +216,12 @@ def prune():
     r=requests.delete(url,headers=HEADERS,params=params,timeout=120);r.raise_for_status()
 
 def main():
+    log(f"Iniciando atualização. UFs={','.join(sorted(UFS)) or 'TODAS'}; retenção={RETENTION_DAYS} dias")
     comp=get_latest_competencia(); old=latest_completed()
     log(f"Competência mais recente: {comp}; última concluída: {old}")
     if old==comp and not FORCE:
-        log("Sem nova competência. Nada a baixar."); return
+        log("Sem nova competência. Nada a baixar.")
+        return
     sid=status_start(comp)
     try:
         municipios=ref_table(comp,"Municipios.zip")
