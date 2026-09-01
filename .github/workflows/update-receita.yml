@@ -1,6 +1,13 @@
 name: Atualizar base CNPJ Receita Federal
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/update_receita.py"
+      - ".github/workflows/update-receita.yml"
+      - "requirements.txt"
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
