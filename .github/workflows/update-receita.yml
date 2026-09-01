@@ -1,0 +1,42 @@
+name: Atualizar base CNPJ Receita Federal
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: "Forçar atualização mesmo sem nova competência?"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      RFB_UFS: ${{ vars.RFB_UFS || 'PA' }}
+      RFB_RETENTION_DAYS: ${{ vars.RFB_RETENTION_DAYS || '180' }}
+      SUPABASE_BATCH_SIZE: "500"
+      FORCE_UPDATE: ${{ github.event.inputs.force_update || '0' }}
+
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Atualizar base da Receita Federal
+        run: python scripts/update_receita.py
