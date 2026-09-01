@@ -1,49 +1,43 @@
 name: Atualizar base CNPJ Receita Federal
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "scripts/update_receita.py"
-      - ".github/workflows/update-receita.yml"
-      - "requirements.txt"
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
-    inputs:
-      force_update:
-        description: "Forçar atualização mesmo sem nova competência?"
-        required: false
-        default: "0"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/update_receita.py"
+      - ".github/workflows/update-receita.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   atualizar:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
-
+    timeout-minutes: 120
     env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       RFB_UFS: ${{ vars.RFB_UFS || 'PA' }}
       RFB_RETENTION_DAYS: ${{ vars.RFB_RETENTION_DAYS || '180' }}
-      SUPABASE_BATCH_SIZE: "500"
-      FORCE_UPDATE: ${{ github.event.inputs.force_update || '0' }}
-
+      RFB_VALIDATION_COMPETENCIA: "2026-08"
+      RFB_VALIDATION_LIMIT: "3000"
     steps:
       - name: Baixar repositório
         uses: actions/checkout@v4
-
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Instalar dependências
         run: pip install -r requirements.txt
-
-      - name: Atualizar base da Receita Federal
+      - name: Gerar base rápida do Pará
         run: python scripts/update_receita.py
+      - name: Publicar base de validação no repositório
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/receita_pa.json data/status.json
+          git diff --cached --quiet && exit 0
+          git commit -m "Atualizar base de validação CNPJ PA"
+          git push
