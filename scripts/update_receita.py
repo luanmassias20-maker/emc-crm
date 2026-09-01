@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import csv, io, os, re, sqlite3, tempfile, time, zipfile
+import csv, io, os, sqlite3, tempfile, time, zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import requests
@@ -12,232 +12,106 @@ SERVICE_KEY=os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 UFS={x.strip().upper() for x in os.getenv("RFB_UFS","PA").split(",") if x.strip()}
 RETENTION_DAYS=int(os.getenv("RFB_RETENTION_DAYS","180"))
 BATCH=int(os.getenv("SUPABASE_BATCH_SIZE","500"))
-FORCE=os.getenv("FORCE_UPDATE","0")=="1"
+VALIDATION_MODE=os.getenv("RFB_VALIDATION_MODE","1")=="1"
+MAX_EST_FILES=int(os.getenv("RFB_MAX_EST_FILES","1" if VALIDATION_MODE else "10"))
+COMPETENCIA=os.getenv("RFB_COMPETENCIA","2026-08").strip()
 HEADERS={"apikey":SERVICE_KEY,"Authorization":f"Bearer {SERVICE_KEY}"}
 
-# Sessao robusta: retries automáticos para timeout, 429 e erros 5xx.
 SESSION=requests.Session()
-retry=Retry(
-    total=6,
-    connect=6,
-    read=6,
-    status=6,
-    backoff_factor=5,
-    status_forcelist=(429,500,502,503,504),
-    allowed_methods=frozenset(["GET","HEAD"]),
-    raise_on_status=False,
-)
+retry=Retry(total=4,connect=4,read=4,status=4,backoff_factor=3,status_forcelist=(429,500,502,503,504),allowed_methods=frozenset(["GET","HEAD"]),raise_on_status=False)
 adapter=HTTPAdapter(max_retries=retry,pool_connections=4,pool_maxsize=4)
 SESSION.mount("https://",adapter)
 SESSION.mount("http://",adapter)
-SESSION.headers.update({"User-Agent":"EMC-CRM-RFB-Updater/2.0 (+https://github.com/luanmassias20-maker/emc-crm)"})
+SESSION.headers.update({"User-Agent":"EMC-CRM-RFB-Updater/validation"})
 
-def log(msg):
-    print(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}",flush=True)
+def log(msg): print(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}",flush=True)
 
-def get_with_fallback(url, *, stream=False, connect_timeout=120, read_timeout=900, attempts=4):
-    """GET resiliente, com tentativas adicionais além das do adapter."""
+def get(url,stream=False,attempts=3,connect=45,read=900):
     last=None
-    for attempt in range(1,attempts+1):
+    for n in range(1,attempts+1):
         try:
-            log(f"Acessando {url} (tentativa {attempt}/{attempts})")
-            r=SESSION.get(url,stream=stream,timeout=(connect_timeout,read_timeout))
-            r.raise_for_status()
-            return r
-        except (requests.ConnectionError,requests.Timeout,requests.HTTPError) as e:
+            log(f"GET {url} tentativa {n}/{attempts}")
+            r=SESSION.get(url,stream=stream,timeout=(connect,read)); r.raise_for_status(); return r
+        except Exception as e:
             last=e
-            if attempt>=attempts:
-                break
-            wait=min(120,15*attempt)
-            log(f"Fonte indisponível temporariamente: {type(e).__name__}. Nova tentativa em {wait}s.")
-            time.sleep(wait)
-    raise RuntimeError(f"Não foi possível acessar {url} após {attempts} tentativas: {last}")
-
-def get_latest_competencia():
-    # O diretório raiz da RFB por vezes demora a responder. Não abortamos na primeira falha.
-    with get_with_fallback(ROOT,connect_timeout=120,read_timeout=180,attempts=5) as r:
-        text=r.text
-    comps=sorted(set(re.findall(r'href=["\'](\d{4}-\d{2})/?["\']',text)))
-    if not comps:
-        comps=sorted(set(re.findall(r'(\d{4}-\d{2})/',text)))
-    if not comps:
-        raise RuntimeError("Nenhuma competência encontrada no diretório oficial da RFB.")
-    return comps[-1]
-
-def latest_completed():
-    url=f"{SUPABASE_URL}/rest/v1/receita_import_status"
-    params={"select":"referencia,status","status":"eq.concluido","order":"id.desc","limit":"1"}
-    r=requests.get(url,headers=HEADERS,params=params,timeout=30); r.raise_for_status()
-    arr=r.json(); return arr[0]["referencia"] if arr else None
-
-def status_start(comp):
-    payload={"referencia":comp,"status":"processando","fonte_url":f"{ROOT}{comp}/",
-             "ufs":",".join(sorted(UFS)),"dias_retencao":RETENTION_DAYS,
-             "verificado_em":datetime.now(timezone.utc).isoformat(),
-             "proxima_verificacao":(datetime.now(timezone.utc)+timedelta(days=7)).isoformat()}
-    h={**HEADERS,"Content-Type":"application/json","Prefer":"return=representation"}
-    r=requests.post(f"{SUPABASE_URL}/rest/v1/receita_import_status",headers=h,json=payload,timeout=30); r.raise_for_status()
-    return r.json()[0]["id"]
-
-def status_finish(row_id,count,error=None):
-    payload={"concluido_em":datetime.now(timezone.utc).isoformat(),"registros":count,
-             "status":"falhou" if error else "concluido","erro":error}
-    h={**HEADERS,"Content-Type":"application/json"}
-    r=requests.patch(f"{SUPABASE_URL}/rest/v1/receita_import_status?id=eq.{row_id}",headers=h,json=payload,timeout=30); r.raise_for_status()
+            if n<attempts:
+                wait=10*n; log(f"Falha temporária: {type(e).__name__}; aguardando {wait}s"); time.sleep(wait)
+    raise RuntimeError(f"Falha ao acessar {url}: {last}")
 
 def download(url,path):
-    log(f"Baixando {url}")
-    with get_with_fallback(url,stream=True,connect_timeout=120,read_timeout=1800,attempts=5) as r:
+    with get(url,stream=True,attempts=3,connect=45,read=1800) as r:
         with open(path,"wb") as f:
             for chunk in r.iter_content(1024*1024):
-                if chunk:
-                    f.write(chunk)
-    if not path.exists() or path.stat().st_size==0:
-        raise RuntimeError(f"Download vazio: {url}")
+                if chunk: f.write(chunk)
+    if not path.exists() or path.stat().st_size==0: raise RuntimeError(f"Download vazio: {url}")
 
 def zip_rows(path):
     with zipfile.ZipFile(path) as z:
-        name=z.namelist()[0]
-        with z.open(name) as raw:
+        with z.open(z.namelist()[0]) as raw:
             txt=io.TextIOWrapper(raw,encoding="latin-1",errors="replace",newline="")
             yield from csv.reader(txt,delimiter=";",quotechar='"')
 
-def clean_text(v): return (v or "").strip()
+def clean(v): return (v or "").strip()
 def parse_date(v):
-    v=clean_text(v)
-    if len(v)==8 and v.isdigit(): return f"{v[:4]}-{v[4:6]}-{v[6:]}"
-    return None
+    v=clean(v); return f"{v[:4]}-{v[4:6]}-{v[6:]}" if len(v)==8 and v.isdigit() else None
 
-def ref_table(comp,filename):
+def ref_table(filename):
     with tempfile.TemporaryDirectory() as td:
-        p=Path(td)/filename
-        download(f"{ROOT}{comp}/{filename}",p)
-        return {clean_text(r[0]):clean_text(r[1]) for r in zip_rows(p) if len(r)>=2}
+        p=Path(td)/filename; download(f"{ROOT}{COMPETENCIA}/{filename}",p)
+        return {clean(r[0]):clean(r[1]) for r in zip_rows(p) if len(r)>=2}
 
-def setup_db(path):
-    c=sqlite3.connect(path)
-    c.executescript("""
-    pragma journal_mode=WAL;
-    create table selected(
-      cnpj text primary key, basic text, razao_social text, nome_fantasia text,
-      data_abertura text, situacao text, cnae text, cnae_desc text, porte text,
-      simples integer, mei integer, municipio text, uf text, telefone text, email text
-    );
-    create index idx_selected_basic on selected(basic);
-    """)
-    return c
+def status_start():
+    payload={"referencia":COMPETENCIA,"status":"processando","fonte_url":f"{ROOT}{COMPETENCIA}/","ufs":",".join(sorted(UFS)),"dias_retencao":RETENTION_DAYS,"verificado_em":datetime.now(timezone.utc).isoformat(),"proxima_verificacao":(datetime.now(timezone.utc)+timedelta(days=7)).isoformat(),"observacao":"modo_validacao" if VALIDATION_MODE else "carga_completa"}
+    h={**HEADERS,"Content-Type":"application/json","Prefer":"return=representation"}
+    r=requests.post(f"{SUPABASE_URL}/rest/v1/receita_import_status",headers=h,json=payload,timeout=30); r.raise_for_status(); return r.json()[0]["id"]
 
-def process_estabelecimentos(comp,conn,municipios,cnaes):
-    cutoff=(date.today()-timedelta(days=RETENTION_DAYS)).strftime("%Y%m%d")
-    inserted=0
-    for i in range(10):
+def status_finish(i,count,error=None):
+    payload={"concluido_em":datetime.now(timezone.utc).isoformat(),"registros":count,"status":"falhou" if error else "concluido","erro":error}
+    r=requests.patch(f"{SUPABASE_URL}/rest/v1/receita_import_status?id=eq.{i}",headers={**HEADERS,"Content-Type":"application/json"},json=payload,timeout=30);r.raise_for_status()
+
+def setup(path):
+    c=sqlite3.connect(path);c.executescript('''create table selected(cnpj text primary key,razao_social text,nome_fantasia text,data_abertura text,situacao text,cnae text,cnae_desc text,porte text,simples integer,mei integer,municipio text,uf text,telefone text,email text);''');return c
+
+def process_est(conn,municipios,cnaes):
+    cutoff=(date.today()-timedelta(days=RETENTION_DAYS)).strftime("%Y%m%d"); total=0
+    for i in range(MAX_EST_FILES):
         with tempfile.TemporaryDirectory() as td:
-            p=Path(td)/f"Estabelecimentos{i}.zip"
-            url=f"{ROOT}{comp}/Estabelecimentos{i}.zip"
-            try:
-                download(url,p)
-            except Exception as e:
-                # Alguns índices podem não existir em determinadas competências.
-                if "404" in str(e):
-                    continue
-                raise
+            p=Path(td)/f"Estabelecimentos{i}.zip"; download(f"{ROOT}{COMPETENCIA}/Estabelecimentos{i}.zip",p)
             batch=[]
             for r in zip_rows(p):
                 if len(r)<30: continue
-                basic,ordem,dv=map(clean_text,r[0:3])
-                situ=clean_text(r[5]); opening=clean_text(r[10]); uf=clean_text(r[19]).upper()
-                if situ!="02" or (UFS and uf not in UFS) or not opening or opening<cutoff: continue
-                cnpj=(basic+ordem+dv).upper()
-                cnae=clean_text(r[11]); mun_code=clean_text(r[20])
-                phone=("".join(ch for ch in (clean_text(r[21])+clean_text(r[22])) if ch.isdigit()))
-                email=clean_text(r[27]).lower()
-                batch.append((cnpj,basic.upper(),None,clean_text(r[4]),parse_date(opening),"ATIVA",cnae,cnaes.get(cnae,""),None,None,None,municipios.get(mun_code,mun_code),uf,phone,email))
-                if len(batch)>=5000:
-                    conn.executemany("insert or replace into selected values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",batch);conn.commit();inserted+=len(batch);batch=[]
-            if batch:
-                conn.executemany("insert or replace into selected values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",batch);conn.commit();inserted+=len(batch)
-            log(f"Estabelecimentos{i}: candidatos acumulados {inserted}")
-    return inserted
-
-def process_empresas(comp,conn):
-    porte={"00":"NAO INFORMADO","01":"ME","03":"EPP","05":"DEMAIS"}
-    for i in range(10):
-        with tempfile.TemporaryDirectory() as td:
-            p=Path(td)/f"Empresas{i}.zip"
-            try:
-                download(f"{ROOT}{comp}/Empresas{i}.zip",p)
-            except Exception as e:
-                if "404" in str(e): continue
-                raise
-            cur=conn.cursor()
-            for r in zip_rows(p):
-                if len(r)<6: continue
-                basic=clean_text(r[0]).upper()
-                if cur.execute("select 1 from selected where basic=? limit 1",(basic,)).fetchone():
-                    cur.execute("update selected set razao_social=?,porte=? where basic=?",(clean_text(r[1]),porte.get(clean_text(r[5]),clean_text(r[5])),basic))
-            conn.commit()
-            log(f"Empresas{i}: enriquecimento concluído")
-
-def process_simples(comp,conn):
-    with tempfile.TemporaryDirectory() as td:
-        p=Path(td)/"Simples.zip"; download(f"{ROOT}{comp}/Simples.zip",p)
-        cur=conn.cursor()
-        for r in zip_rows(p):
-            if len(r)<5: continue
-            basic=clean_text(r[0]).upper()
-            if cur.execute("select 1 from selected where basic=? limit 1",(basic,)).fetchone():
-                cur.execute("update selected set simples=?,mei=? where basic=?",(1 if clean_text(r[1])=="S" else 0,1 if clean_text(r[4])=="S" else 0,basic))
-        conn.commit()
-
-def upsert_supabase(conn):
-    cur=conn.execute("""select cnpj,coalesce(razao_social,nome_fantasia,''),nome_fantasia,data_abertura,situacao,cnae,cnae_desc,
-                       porte,simples,mei,municipio,uf,telefone,email from selected where coalesce(razao_social,nome_fantasia,'')<>''""")
-    url=f"{SUPABASE_URL}/rest/v1/receita_empresas?on_conflict=cnpj"
-    h={**HEADERS,"Content-Type":"application/json","Prefer":"resolution=merge-duplicates,return=minimal"}
-    total=0;batch=[]
-    for r in cur:
-        batch.append({"cnpj":r[0],"razao_social":r[1],"nome_fantasia":r[2],"data_abertura":r[3],"situacao_cadastral":r[4],
-                      "cnae_principal":r[5],"cnae_descricao":r[6],"porte":r[7],"simples":None if r[8] is None else bool(r[8]),
-                      "mei":None if r[9] is None else bool(r[9]),"municipio":r[10],"uf":r[11],"telefone":r[12],"email":r[13],
-                      "updated_at":datetime.now(timezone.utc).isoformat()})
-        if len(batch)>=BATCH:
-            rr=requests.post(url,headers=h,json=batch,timeout=120);rr.raise_for_status();total+=len(batch);batch=[]
-            log(f"Upsert Supabase: {total}")
-    if batch:
-        rr=requests.post(url,headers=h,json=batch,timeout=120);rr.raise_for_status();total+=len(batch)
+                situ,opening,uf=clean(r[5]),clean(r[10]),clean(r[19]).upper()
+                if situ!="02" or uf not in UFS or not opening or opening<cutoff: continue
+                cnpj=(clean(r[0])+clean(r[1])+clean(r[2])).upper(); fantasy=clean(r[4])
+                cnae=clean(r[11]); phone=''.join(ch for ch in clean(r[21])+clean(r[22]) if ch.isdigit()); email=clean(r[27]).lower(); mun=municipios.get(clean(r[20]),clean(r[20]))
+                display=fantasy or f"CNPJ {cnpj}"
+                batch.append((cnpj,display,fantasy,parse_date(opening),"ATIVA",cnae,cnaes.get(cnae,""),None,None,None,mun,uf,phone,email))
+                if len(batch)>=3000:
+                    conn.executemany("insert or replace into selected values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",batch);conn.commit();total+=len(batch);batch=[]
+            if batch: conn.executemany("insert or replace into selected values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",batch);conn.commit();total+=len(batch)
+            log(f"Arquivo {i}: {total} empresas PA recentes selecionadas")
     return total
 
-def prune():
-    cutoff=(date.today()-timedelta(days=RETENTION_DAYS)).isoformat()
-    url=f"{SUPABASE_URL}/rest/v1/receita_empresas"
-    params={"data_abertura":f"lt.{cutoff}"}
-    if len(UFS)==1: params["uf"]=f"eq.{next(iter(UFS))}"
-    elif UFS: params["uf"]="in.("+",".join(UFS)+")"
-    r=requests.delete(url,headers=HEADERS,params=params,timeout=120);r.raise_for_status()
+def upsert(conn):
+    rows=conn.execute("select * from selected");url=f"{SUPABASE_URL}/rest/v1/receita_empresas?on_conflict=cnpj";h={**HEADERS,"Content-Type":"application/json","Prefer":"resolution=merge-duplicates,return=minimal"};batch=[];total=0
+    keys=['cnpj','razao_social','nome_fantasia','data_abertura','situacao_cadastral','cnae_principal','cnae_descricao','porte','simples','mei','municipio','uf','telefone','email']
+    for row in rows:
+        item=dict(zip(keys,row));item['updated_at']=datetime.now(timezone.utc).isoformat();batch.append(item)
+        if len(batch)>=BATCH:
+            r=requests.post(url,headers=h,json=batch,timeout=120);r.raise_for_status();total+=len(batch);batch=[];log(f"Supabase: {total}")
+    if batch:
+        r=requests.post(url,headers=h,json=batch,timeout=120);r.raise_for_status();total+=len(batch)
+    return total
 
 def main():
-    log(f"Iniciando atualização. UFs={','.join(sorted(UFS)) or 'TODAS'}; retenção={RETENTION_DAYS} dias")
-    comp=get_latest_competencia(); old=latest_completed()
-    log(f"Competência mais recente: {comp}; última concluída: {old}")
-    if old==comp and not FORCE:
-        log("Sem nova competência. Nada a baixar.")
-        return
-    sid=status_start(comp)
+    log(f"MODO={'VALIDAÇÃO' if VALIDATION_MODE else 'COMPLETO'} competencia={COMPETENCIA} UFs={','.join(sorted(UFS))} arquivos_est={MAX_EST_FILES}")
+    sid=status_start()
     try:
-        municipios=ref_table(comp,"Municipios.zip")
-        cnaes=ref_table(comp,"Cnaes.zip")
+        municipios=ref_table("Municipios.zip"); cnaes=ref_table("Cnaes.zip")
         with tempfile.TemporaryDirectory() as td:
-            conn=setup_db(Path(td)/"etl.sqlite")
-            process_estabelecimentos(comp,conn,municipios,cnaes)
-            process_empresas(comp,conn)
-            process_simples(comp,conn)
-            total=upsert_supabase(conn)
-            prune()
-        status_finish(sid,total)
-        log(f"Atualização concluída: {total} empresas sincronizadas.")
+            conn=setup(Path(td)/"etl.sqlite"); found=process_est(conn,municipios,cnaes); log(f"Candidatos encontrados: {found}"); total=upsert(conn)
+        status_finish(sid,total); log(f"VALIDAÇÃO CONCLUÍDA: {total} registros enviados ao Supabase")
     except Exception as e:
-        status_finish(sid,0,str(e)[:2000])
-        raise
+        status_finish(sid,0,str(e)[:2000]); raise
 
-if __name__=="__main__":
-    main()
+if __name__=="__main__": main()
