@@ -1,46 +1,13 @@
-name: Atualizar base CNPJ Receita Federal
+name: Arquivo - carga Dados Abertos Receita
 
 on:
-  schedule:
-    - cron: "0 6 * * 1"
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - "scripts/update_receita.py"
-      - "scripts/patch_index_validation.py"
-      - ".github/workflows/update-receita.yml"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  atualizar:
+  arquivado:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      RFB_UFS: ${{ vars.RFB_UFS || 'PA' }}
-      RFB_RETENTION_DAYS: ${{ vars.RFB_RETENTION_DAYS || '180' }}
-      RFB_VALIDATION_COMPETENCIA: "2026-08"
-      RFB_VALIDATION_LIMIT: "3000"
     steps:
-      - name: Baixar repositório
-        uses: actions/checkout@v4
-      - name: Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Instalar dependências
-        run: pip install -r requirements.txt
-      - name: Gerar base rápida do Pará
-        run: python scripts/update_receita.py
-      - name: Preparar CRM para base local
-        run: python scripts/patch_index_validation.py
-      - name: Publicar validação no repositório
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/receita_pa.json data/status.json index.html
-          git diff --cached --quiet && exit 0
-          git commit -m "Atualizar base de validação CNPJ PA"
-          git push
+      - run: echo "Fluxo arquivado. O EMC CRM agora utiliza Consulta CNPJ SERPRO sob demanda."
